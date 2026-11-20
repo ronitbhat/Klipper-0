@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from clip import (
+    safe_analyze_video_window,
     write_ass,
     build_video_filter, choose_crop_offset, choose_vertical_game_roi, gameplay_crop_offset, reaction_score,
     should_apply_smart_crop,
@@ -22,6 +23,41 @@ from clip import (
     NVENC_VIDEO_ARGS, CPU_VIDEO_ARGS,
 )
 
+class GameplayVisionIntegrationTests(unittest.TestCase):
+
+    def test_successful_vision_analysis_is_returned(self):
+        expected = {
+            "status": "success",
+            "analysis": {
+                "event_type": "vehicle_stunt",
+                "notable": True,
+            },
+        }
+
+        with patch("clip.analyze_video_window", return_value=expected) as analyze:
+            result = safe_analyze_video_window(
+                "chunk.ts", 2.0, 8.0, "test-model"
+            )
+
+        self.assertEqual(result, expected)
+        analyze.assert_called_once_with(
+            "chunk.ts", 2.0, 10.0,
+            model="test-model",
+            frame_count=3,
+        )
+
+    def test_vision_failure_does_not_raise_an_exception(self):
+        with patch(
+            "clip.analyze_video_window",
+            side_effect=RuntimeError("model crashed"),
+        ):
+            result = safe_analyze_video_window(
+                "chunk.ts", 2.0, 8.0, "test-model"
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIsNone(result["analysis"])
+        self.assertIn("model crashed", result["error"])
 
 class ClipperReleaseTests(unittest.TestCase):
     def test_fit_layout_keeps_the_full_source_over_a_blurred_background(self):

@@ -6,6 +6,7 @@ import argparse, glob, json, math, os, re, shutil, subprocess, sys, time
 from datetime import datetime
 import numpy as np
 from live_chat import create_live_chat_collector, score_chat_windows, summarize_chat_window
+from gameplay_vision import analyze_video_window
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(HERE, "output")
@@ -21,6 +22,30 @@ REACTION_PHRASES = {
     ("what", "just", "happened"): 1.0, ("no", "fucking", "way"): 2.0,
 }
 DEFAULT_MIN_SCORE = 2.5
+def safe_analyze_video_window(video_path, start, duration, model):
+    """Run gameplay vision without allowing failures to interrupt clipping."""
+    try:
+        result = analyze_video_window(
+            video_path,
+            start,
+            start + duration,
+            model=model,
+            frame_count=3,
+        )
+
+        if not isinstance(result, dict) or result.get("status") != "success":
+            error = result.get("error", "unknown error") if isinstance(result, dict) else "invalid vision response"
+            print(f"  vision analysis unavailable: {error}")
+
+        return result
+
+    except Exception as exc:
+        print(f"  vision analysis failed: {exc}")
+        return {
+            "status": "error",
+            "analysis": None,
+            "error": str(exc),
+        }
 FACE_MODEL = os.path.join(HERE, "models", "face_detection_yunet_2023mar.onnx")
 
 
@@ -753,6 +778,17 @@ def main():
                          "hi / en: force it for the whole stream")
     ap.add_argument("--encoder", choices=VALID_ENCODERS, default=ENCODER_AUTO,
                     help="video encoder: auto (default, try NVENC then fall back to libx264), nvenc, cpu")
+    ap.add_argument(
+        "--vision",
+        choices=("off", "shadow"),
+        default="off",
+        help="gameplay vision analysis: off (default) or shadow (record findings without changing selection)",
+    )
+    ap.add_argument(
+        "--vision-model",
+        default="Qwen/Qwen3-VL-2B-Instruct-GGUF:Q4_K_M",
+        help="local Qwen3-VL model used when vision is enabled",
+    )
     ap.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
     ap.add_argument("--keep-minutes", type=int, default=30)
     ap.add_argument("--output-dir", default=None, help="override the output folder")
@@ -782,9 +818,14 @@ def main():
         who = source_identity(info, a.test)
         title = info.get("title", "")
     else:
-        who, title, info = source_identity({"uploader": "local source"}, True), os.path.basename(a.file), {}
+        who, title, info = source_identity({}, True), os.path.basename(a.file), {}
     out_dir = os.path.abspath(a.output_dir) if a.output_dir else (TEST_OUT if who["test"] else OUTPUT_DIR)
     os.makedirs(out_dir, exist_ok=True)
+    vision_enabled = a.vision == "shadow"
+    if vision_enabled:
+        print(f"gameplay vision: shadow mode ({a.vision_model})")
+    else:
+        print("gameplay vision: disabled")
     wdir = os.path.join(WORK, datetime.now().strftime("%Y%m%d-%H%M%S"))
     print(f"source: {title!r} by {who['name']}  ->  {out_dir}")
     print(f"video encoder: {a.encoder}")
@@ -828,6 +869,12 @@ def main():
             moments, words = pick_moments(c, a.clip_len, a.top, a.min_score, a.lead_in,
                                           chunk_chat, chunk_moment_source)
             for score, start in moments:
+                vision_result = (
+                    safe_analyze_video_window(c, start, a.clip_len, a.vision_model)
+                    if vision_enabled else None
+                )
+                        
+
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 name = f"gta-{stamp}-{n_clips + 1}"
                 mp4 = os.path.join(out_dir, name + ".mp4")
@@ -865,6 +912,7 @@ def main():
                             "caption_position": "lower-third-of-visible-gameplay",
                             "framing": "fill-9x16" if smart_crop else "full-source-blur-fill",
                             "gameplay_confirmed": a.gameplay_confirmed,
+                            "gameplay_vision": vision_result,
                             "moment_source_requested": a.moment_source,
                             "moment_source_used": chunk_moment_source,
                             "selection_signals": selection_signals,
