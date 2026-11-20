@@ -1,7 +1,9 @@
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import numpy as np
 
@@ -14,6 +16,10 @@ from clip import (
     should_apply_smart_crop,
     source_identity, select_clip_start,
     DEFAULT_MAX_SECONDS, pick_moments, mask_word, ytdlp_cmd,
+    cut, build_cut_cmd, get_encoder_args, reset_encoder_state,
+    check_nvenc_available, is_nvenc_available,
+    ENCODER_AUTO, ENCODER_NVENC, ENCODER_CPU,
+    NVENC_VIDEO_ARGS, CPU_VIDEO_ARGS,
 )
 
 
@@ -164,8 +170,176 @@ class PopCaptionTests(unittest.TestCase):
             self.assertLessEqual(len(visible), 24)
 
 
-if __name__ == '__main__':
-    unittest.main()
+class VideoEncoderTests(unittest.TestCase):
+    def setUp(self):
+        reset_encoder_state()
+
+    def tearDown(self):
+        reset_encoder_state()
+
+    def test_ffmpeg_args_for_nvenc(self):
+        nvenc_args = get_encoder_args("nvenc")
+        expected = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"]
+        self.assertEqual(nvenc_args, expected)
+
+        cmd = build_cut_cmd("chunk.ts", 5.0, 30.0, "filter_graph", "out.mp4", encoder="nvenc")
+        self.assertIn("-c:v", cmd)
+        idx = cmd.index("-c:v")
+        self.assertEqual(cmd[idx:idx + len(expected)], expected)
+
+    def test_ffmpeg_args_for_cpu(self):
+        cpu_args = get_encoder_args("cpu")
+        expected = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p"]
+        self.assertEqual(cpu_args, expected)
+
+        cmd = build_cut_cmd("chunk.ts", 5.0, 30.0, "filter_graph", "out.mp4", encoder="cpu")
+        self.assertIn("-c:v", cmd)
+        idx = cmd.index("-c:v")
+        self.assertEqual(cmd[idx:idx + len(expected)], expected)
+
+    def test_existing_rendering_args_remain_unchanged(self):
+        chunk = "chunk_00001.ts"
+        out_name = "test_clip.mp4"
+        cmd = build_cut_cmd(chunk, 12.34, 30.0, "filter_graph_test", out_name, encoder="cpu")
+
+        expected = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", "12.34",
+            "-i", os.path.abspath(chunk),
+            "-t", "30.0",
+            "-filter_complex", "filter_graph_test",
+            "-af", "asetpts=PTS-STARTPTS",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "21",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            out_name,
+        ]
+        self.assertEqual(cmd, expected)
+
+    @patch("clip.subprocess.run")
+    def test_auto_fallback_when_nvenc_fails(self, mock_run):
+        with tempfile.TemporaryDirectory() as d:
+            out_mp4 = os.path.join(d, "clip.mp4")
+            nvenc_proc = MagicMock(returncode=1, stderr="[h264_nvenc] Cannot load libnvidia-encode.so.1")
+            cpu_proc = MagicMock(returncode=0, stdout="", stderr="")
+            mock_run.side_effect = [nvenc_proc, cpu_proc]
+
+            success = cut("chunk.ts", [], 0.0, 30.0, out_mp4, "Credit", encoder="auto")
+            self.assertTrue(success)
+            self.assertEqual(mock_run.call_count, 2)
+
+            first_call_cmd = mock_run.call_args_list[0][0][0]
+            second_call_cmd = mock_run.call_args_list[1][0][0]
+
+            self.assertIn("h264_nvenc", first_call_cmd)
+            self.assertIn("libx264", second_call_cmd)
+
+    @patch("clip.subprocess.run")
+    def test_explicit_nvenc_failure_behavior(self, mock_run):
+        with tempfile.TemporaryDirectory() as d:
+            out_mp4 = os.path.join(d, "clip.mp4")
+            mock_run.return_value = MagicMock(returncode=1, stderr="[h264_nvenc] No NVENC capable devices found")
+
+            success = cut("chunk.ts", [], 0.0, 30.0, out_mp4, "Credit", encoder="nvenc")
+            self.assertFalse(success)
+            self.assertEqual(mock_run.call_count, 1)
+
+            call_cmd = mock_run.call_args_list[0][0][0]
+            self.assertIn("h264_nvenc", call_cmd)
+            self.assertNotIn("libx264", call_cmd)
+
+    @patch("clip.subprocess.run")
+    def test_auto_mode_avoids_repeated_nvenc_checks_after_failure(self, mock_run):
+        with tempfile.TemporaryDirectory() as d:
+            out_mp4_1 = os.path.join(d, "clip1.mp4")
+            out_mp4_2 = os.path.join(d, "clip2.mp4")
+
+            nvenc_proc = MagicMock(returncode=1, stderr="NVENC failed")
+            cpu_proc1 = MagicMock(returncode=0, stdout="", stderr="")
+            cpu_proc2 = MagicMock(returncode=0, stdout="", stderr="")
+            mock_run.side_effect = [nvenc_proc, cpu_proc1, cpu_proc2]
+
+            success1 = cut("chunk.ts", [], 0.0, 30.0, out_mp4_1, "Credit", encoder="auto")
+            self.assertTrue(success1)
+            self.assertEqual(mock_run.call_count, 2)
+
+            success2 = cut("chunk.ts", [], 30.0, 30.0, out_mp4_2, "Credit", encoder="auto")
+            self.assertTrue(success2)
+            self.assertEqual(mock_run.call_count, 3)
+
+            third_call_cmd = mock_run.call_args_list[2][0][0]
+            self.assertIn("libx264", third_call_cmd)
+            self.assertNotIn("h264_nvenc", third_call_cmd)
+
+    @patch("clip.subprocess.run")
+    def test_auto_mode_uses_nvenc_when_available(self, mock_run):
+        with tempfile.TemporaryDirectory() as d:
+            out_mp4 = os.path.join(d, "clip.mp4")
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+            success = cut("chunk.ts", [], 0.0, 30.0, out_mp4, "Credit", encoder="auto")
+            self.assertTrue(success)
+            self.assertEqual(mock_run.call_count, 1)
+
+            call_cmd = mock_run.call_args_list[0][0][0]
+            self.assertIn("h264_nvenc", call_cmd)
+
+    @patch("clip.subprocess.run")
+    def test_no_partial_output_file_left_on_failure(self, mock_run):
+        with tempfile.TemporaryDirectory() as d:
+            out_mp4 = os.path.join(d, "clip.mp4")
+
+            def create_corrupt_file_and_fail(cmd, **kwargs):
+                with open(out_mp4, "wb") as f:
+                    f.write(b"partial corrupted data")
+                return MagicMock(returncode=1, stderr="Encoder failure")
+
+            mock_run.side_effect = create_corrupt_file_and_fail
+
+            success = cut("chunk.ts", [], 0.0, 30.0, out_mp4, "Credit", encoder="nvenc")
+            self.assertFalse(success)
+            self.assertFalse(os.path.exists(out_mp4))
+
+    @patch("clip.subprocess.run")
+    def test_partial_output_removed_before_fallback(self, mock_run):
+        with tempfile.TemporaryDirectory() as d:
+            out_mp4 = os.path.join(d, "clip.mp4")
+
+            def side_effect(cmd, **kwargs):
+                if "h264_nvenc" in cmd:
+                    with open(out_mp4, "wb") as f:
+                        f.write(b"partial nvenc data")
+                    return MagicMock(returncode=1, stderr="NVENC failed")
+                else:
+                    self.assertFalse(os.path.exists(out_mp4))
+                    with open(out_mp4, "wb") as f:
+                        f.write(b"valid cpu mp4 data")
+                    return MagicMock(returncode=0, stdout="", stderr="")
+
+            mock_run.side_effect = side_effect
+
+            success = cut("chunk.ts", [], 0.0, 30.0, out_mp4, "Credit", encoder="auto")
+            self.assertTrue(success)
+            self.assertTrue(os.path.exists(out_mp4))
+            with open(out_mp4, "rb") as f:
+                self.assertEqual(f.read(), b"valid cpu mp4 data")
+
+    @patch("clip.subprocess.run")
+    def test_capability_check_caching(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        self.assertTrue(check_nvenc_available())
+        self.assertTrue(check_nvenc_available())
+        self.assertEqual(mock_run.call_count, 1)
+
+        reset_encoder_state()
+        mock_run.return_value = MagicMock(returncode=1)
+        self.assertFalse(check_nvenc_available())
+        self.assertFalse(check_nvenc_available())
+        self.assertEqual(mock_run.call_count, 2)
 
 
 class SpokenLanguageLockTest(unittest.TestCase):
@@ -187,3 +361,7 @@ class SpokenLanguageLockTest(unittest.TestCase):
         self.assertEqual(clip.locked_language(), "hi")
         clip._forced_language = None
         clip._lang_votes = {}
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -60,6 +60,7 @@ Important options:
 | `--crop` | off | Old flag, same as `--layout fill` |
 | `--moment-source` | `chat` | Choose `chat`, `combined`, or `audio` for highlight selection |
 | `--spoken-language` | `auto` | `auto` detects the language and locks to Hindi (Hinglish captions) once a stream is clearly Hindi. `hi` / `en` force it for the whole stream |
+| `--encoder` | `auto` | Video encoder: `auto` (default, try NVIDIA NVENC and fall back to libx264), `nvenc` (explicit NVENC), or `cpu` (libx264) |
 | `--no-chat` | off | Skip live-chat collection and use audio and speech only |
 | `--output-dir` | `output/` | Custom destination folder |
 

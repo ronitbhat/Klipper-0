@@ -575,24 +575,150 @@ def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, l
             "[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts=PTS-STARTPTS,ass=" + ass_name)
 
 
+ENCODER_AUTO = "auto"
+ENCODER_NVENC = "nvenc"
+ENCODER_CPU = "cpu"
+VALID_ENCODERS = (ENCODER_AUTO, ENCODER_NVENC, ENCODER_CPU)
+
+NVENC_VIDEO_ARGS = [
+    "-c:v", "h264_nvenc",
+    "-preset", "p4",
+    "-cq", "21",
+    "-b:v", "0",
+    "-pix_fmt", "yuv420p",
+]
+
+CPU_VIDEO_ARGS = [
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "21",
+    "-pix_fmt", "yuv420p",
+]
+
+_nvenc_available = None
+
+
+def reset_encoder_state():
+    """Reset the cached NVENC availability state (useful for tests)."""
+    global _nvenc_available
+    _nvenc_available = None
+
+
+def check_nvenc_available():
+    """Check if NVIDIA NVENC encoder is available in FFmpeg, caching the result."""
+    global _nvenc_available
+    if _nvenc_available is not None:
+        return _nvenc_available
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+             "-i", "color=s=64x64:d=0.04", "-c:v", "h264_nvenc", "-f", "null", "-"],
+            capture_output=True, text=True,
+        )
+        _nvenc_available = (r.returncode == 0)
+    except Exception:
+        _nvenc_available = False
+    return _nvenc_available
+
+
+is_nvenc_available = check_nvenc_available
+
+
+def get_encoder_args(encoder="cpu"):
+    """Return video encoder FFmpeg arguments for 'nvenc' or 'cpu'."""
+    enc = (encoder or "cpu").lower()
+    if enc == ENCODER_NVENC:
+        return list(NVENC_VIDEO_ARGS)
+    if enc == ENCODER_CPU:
+        return list(CPU_VIDEO_ARGS)
+    raise ValueError(f"Unsupported encoder for args: {encoder}")
+
+
+def build_cut_cmd(chunk_path, start, length, fg, out_name, encoder="cpu"):
+    """Construct FFmpeg command list for cutting and rendering a clip."""
+    v_args = get_encoder_args(encoder)
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{start:.2f}",
+        "-i", os.path.abspath(chunk_path),
+        "-t", f"{length}",
+        "-filter_complex", fg,
+        "-af", "asetpts=PTS-STARTPTS",
+        *v_args,
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        out_name,
+    ]
+
+
 def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offset=0.5,
-        source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None):
+        source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None, encoder="auto"):
+    global _nvenc_available
     d = os.path.dirname(out_mp4)
-    ass_name = "cap_" + os.path.basename(out_mp4) + ".ass"
-    write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v)
+    out_name = os.path.basename(out_mp4)
+    out_file = os.path.join(d, out_name) if d else out_name
+    ass_name = "cap_" + out_name + ".ass"
+    ass_path = os.path.join(d, ass_name) if d else ass_name
+
+    write_ass(ass_path, words, start, length, credit, caption_margin_v)
     fg = build_video_filter(ass_name, crop=crop, crop_offset=crop_offset, source_roi=source_roi, layout=layout,
                             pan_keys=pan_keys)
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
-                        "-i", os.path.abspath(chunk_path), "-t", f"{length}",
-                        "-filter_complex", fg, "-af", "asetpts=PTS-STARTPTS",
-                        "-c:v", "libx264", "-preset", "veryfast",
-                        "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
-                        os.path.basename(out_mp4)], cwd=d, capture_output=True, text=True)
-    os.remove(os.path.join(d, ass_name))
-    if r.returncode:
-        print("ffmpeg cut failed:", r.stderr[-300:])
+
+    def _cleanup_output():
+        if os.path.exists(out_file):
+            try:
+                os.remove(out_file)
+            except OSError:
+                pass
+
+    enc = (encoder or ENCODER_AUTO).lower()
+    if enc not in VALID_ENCODERS:
+        raise ValueError(f"Unknown encoder: {encoder}. Valid options: {VALID_ENCODERS}")
+
+    success = False
+    try:
+        target_encoder = (
+            ENCODER_CPU
+            if (enc == ENCODER_AUTO and _nvenc_available is False)
+            else (ENCODER_NVENC if enc == ENCODER_AUTO else enc)
+        )
+
+        cmd = build_cut_cmd(chunk_path, start, length, fg, out_name, encoder=target_encoder)
+        r = subprocess.run(cmd, cwd=d or None, capture_output=True, text=True)
+
+        if r.returncode == 0:
+            if target_encoder == ENCODER_NVENC:
+                _nvenc_available = True
+            success = True
+            return True
+
+        # First attempt failed; clean up partial output
+        _cleanup_output()
+
+        if enc == ENCODER_AUTO and target_encoder == ENCODER_NVENC:
+            _nvenc_available = False
+            err_msg = r.stderr[-200:].strip() if r.stderr else "unknown error"
+            print(f"NVENC encoding failed ({err_msg}), falling back to libx264...")
+            fallback_cmd = build_cut_cmd(chunk_path, start, length, fg, out_name, encoder=ENCODER_CPU)
+            r_fb = subprocess.run(fallback_cmd, cwd=d or None, capture_output=True, text=True)
+            if r_fb.returncode == 0:
+                success = True
+                return True
+            _cleanup_output()
+            print("ffmpeg cut failed (cpu fallback):", r_fb.stderr[-300:])
+            return False
+
+        print(f"ffmpeg cut failed ({target_encoder}):", r.stderr[-300:])
         return False
-    return True
+    finally:
+        if not success:
+            _cleanup_output()
+        if os.path.exists(ass_path):
+            try:
+                os.remove(ass_path)
+            except OSError:
+                pass
 
 
 # ---------- main loop ----------
@@ -625,6 +751,8 @@ def main():
     ap.add_argument("--spoken-language", choices=("auto", "en", "hi"), default="auto",
                     help="auto (default): detect, and lock to Hindi once the stream is clearly Hindi (Hinglish captions); "
                          "hi / en: force it for the whole stream")
+    ap.add_argument("--encoder", choices=VALID_ENCODERS, default=ENCODER_AUTO,
+                    help="video encoder: auto (default, try NVENC then fall back to libx264), nvenc, cpu")
     ap.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
     ap.add_argument("--keep-minutes", type=int, default=30)
     ap.add_argument("--output-dir", default=None, help="override the output folder")
@@ -659,6 +787,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     wdir = os.path.join(WORK, datetime.now().strftime("%Y%m%d-%H%M%S"))
     print(f"source: {title!r} by {who['name']}  ->  {out_dir}")
+    print(f"video encoder: {a.encoder}")
     print(f"moment finder: {a.moment_source} (chat mode falls back to audio/speech when chat is unavailable)")
     chat = None
     chat_source, chat_fallback = "disabled", None
@@ -714,7 +843,8 @@ def main():
                 caption_margin_v = caption_margin_for_video(c, crop=smart_crop, source_roi=None if smart_crop else source_roi)
                 if cut(c, words, start, a.clip_len, mp4, who.get("credit"), crop=smart_crop,
                        crop_offset=crop_offset, source_roi=source_roi,
-                       caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys):
+                       caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys,
+                       encoder=a.encoder):
                     n_clips += 1
                     text = " ".join(w[2] for w in words if start <= w[0] < start + a.clip_len)
                     chat_summary = summarize_chat_window(chunk_chat, start, a.clip_len)
